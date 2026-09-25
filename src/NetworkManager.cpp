@@ -1,6 +1,7 @@
 #include <Preferences.h>
 #include "OTAUpdater.h"
 #include "NetworkManager.h"
+#include "MLInference.h"
 
 bool remote_debug_enabled = false;
 
@@ -305,8 +306,9 @@ void NetworkManager::publishStatus(String status, bool sensor_ok, float tilt_ang
 
     char statusPayload[512];
     snprintf(statusPayload, sizeof(statusPayload),
-        "{\"status\":\"%s\",\"node_id\":\"%s\",\"lat\":%.4f,\"lon\":%.4f,\"pose\":\"%s\",\"tilt_angle\":%.1f,\"sensor_ok\":%s,\"fw_version\":\"%s\",\"ota_status\":\"%s\",\"motion_detected\":%s}",
-        status.c_str(), _configMgr->config.node_id, _configMgr->config.lat, _configMgr->config.lon, pose.c_str(), tilt_angle, sensor_ok ? "true" : "false", CURRENT_VERSION, otaUpdater.ota_status.c_str(), motion_detected ? "true" : "false");
+        "{\"status\":\"%s\",\"node_id\":\"%s\",\"lat\":%.4f,\"lon\":%.4f,\"pose\":\"%s\",\"tilt_angle\":%.1f,\"sensor_ok\":%s,\"fw_version\":\"%s\",\"ota_status\":\"%s\",\"motion_detected\":%s,\"ml_model\":\"%s\"}",
+        status.c_str(), _configMgr->config.node_id, _configMgr->config.lat, _configMgr->config.lon, pose.c_str(), tilt_angle, sensor_ok ? "true" : "false", CURRENT_VERSION, otaUpdater.ota_status.c_str(), motion_detected ? "true" : "false",
+        mlInference.isReady() ? mlInference.modelVersion() : "none");
 
     mqtt.publish(willTopic, statusPayload, true);
 }

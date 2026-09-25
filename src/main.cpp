@@ -7,6 +7,7 @@
 #include "ConfigManager.h"
 #include "NetworkManager.h"
 #include "SensorManager.h"
+#include "MLInference.h"
 #include "OTAUpdater.h"
 #include <WiFi.h>
 #include "esp_ota_ops.h"
@@ -341,6 +342,11 @@ void networkTaskCode(void* parameter) {
         // Cek apakah ada data sensor di antrean (Non-Blocking)
         if (xQueueReceive(eventQueue, &ev, 0) == pdTRUE) {
             local_latest_pga = ev.pga;
+
+            // Isi jendela model. Murah: hanya menyalin satu struct ke ring
+            // buffer berukuran tetap, tanpa alokasi memori.
+            mlInference.addSample(ev, getEpochTime());
+
             if (ev.pga > 0.12) {
                 local_alarm_until = millis() + 5000; // Tahan warna pink selama 5 detik
                 
@@ -352,9 +358,36 @@ void networkTaskCode(void* parameter) {
                 // aktif, loop occupancy di networkTaskCode yang menentukan: unlock hanya
                 // kalau PIR mendeteksi orang dalam 10 menit terakhir, sama seperti alarm biasa.
                 // Ini adalah garis pertahanan terakhir saat infrastruktur internet runtuh.
-                if (!networkMgr.isConnected() && ev.pga > 0.60) {
-                    Serial.println("[!!!] LONE WOLF MODE: Server offline + PGA EKSTREM! Mengambil alih kendali!");
-                    networkMgr.publishLog("LONE WOLF MODE DIINTIASI! Server Offline & PGA Ekstrem.");
+                //
+                // Lapisan kecerdasan (Assignment 3) MENURUNKAN ambang itu, dan
+                // hanya itu. Model boleh membuat node bertindak LEBIH CEPAT pada
+                // guncangan yang dikenalinya sebagai gempa, tetapi tidak pernah
+                // diberi hak MEMBATALKAN pemicu PGA > 0.60.
+                //
+                // Kenapa tidak boleh membatalkan: saat server tak terjangkau,
+                // salah menahan aksi pada gempa sungguhan berarti katup gas
+                // tetap terbuka di bangunan yang sedang runtuh. Biaya kesalahan
+                // ke arah itu jauh lebih besar daripada sirine yang sesekali
+                // berbunyi karena palu godam.
+                bool lone_wolf = (ev.pga > 0.60);
+                const char* alasan = "PGA Ekstrem";
+
+                if (!lone_wolf && mlInference.isReady() && ev.pga > 0.25) {
+                    MLResult ml = mlInference.predict();
+                    if (ml.valid && strcmp(ml.label, "earthquake") == 0 &&
+                        ml.confidence >= 0.90f) {
+                        lone_wolf = true;
+                        alasan = "Model mengenali pola gempa";
+                    }
+                }
+
+                if (!networkMgr.isConnected() && lone_wolf) {
+                    Serial.printf("[!!!] LONE WOLF MODE: Server offline + %s! Mengambil alih kendali!\n", alasan);
+                    char pesan[128];
+                    snprintf(pesan, sizeof(pesan),
+                             "LONE WOLF MODE DIINTIASI! Server Offline & %s (PGA %.2fG).",
+                             alasan, ev.pga);
+                    networkMgr.publishLog(pesan);
                     global_alarm_until = millis() + 15000; // Sirine merah 15 detik
                     is_valve_locked = true;
                     actPrefs.putBool("valve_locked", true);
@@ -500,6 +533,7 @@ void setup() {
     );
     
     // 4. Inisialisasi Sensor di Core 1
+    mlInference.begin();
     sensorMgr.begin(eventQueue);
     otaUpdater.begin();
 }
