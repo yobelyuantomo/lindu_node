@@ -21,7 +21,7 @@ void ConfigManager::loadConfig() {
     String srv = prefs.getString("mqtt_srv", "192.168.68.105");
     strlcpy(config.mqtt_server, srv.c_str(), sizeof(config.mqtt_server));
     config.is_provisioned = (config.lat != 0.0);
-    String repo = prefs.getString("ota_repo", "Lindu-EEW/lindu_node");
+    String repo = prefs.getString("ota_repo", "yobelyuantomo/lindu_node");
     strlcpy(config.ota_repo, repo.c_str(), sizeof(config.ota_repo));
 
 }
