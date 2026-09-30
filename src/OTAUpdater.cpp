@@ -35,6 +35,18 @@ const char* rootCACertificate = \
 void OTAUpdater::begin() {
     _prefs.begin("ota", false);
     _failed_tag = _prefs.getString("failed_tag", "");
+
+    // Penanda ini ditulis sesaat sebelum reboot setelah unduhan sukses. Bila
+    // firmware yang sedang berjalan bertag sama, berarti versi itu berhasil
+    // boot, jadi penandanya dihapus. Pembersihan lama di main.cpp hanya jalan
+    // bila state bootloader PENDING_VERIFY, yang tidak selalu terjadi; akibatnya
+    // versi yang baru saja terpasang ikut terblacklist dan menghalangi OTA
+    // ulang ke tag yang sama (ERROR_BLACKLISTED yang palsu).
+    if (_failed_tag.length() > 0 && _failed_tag == CURRENT_VERSION) {
+        Serial.println("[OTA] Penanda blacklist " + _failed_tag + " dihapus: firmware ini berhasil boot.");
+        _prefs.remove("failed_tag");
+        _failed_tag = "";
+    }
     
     // Validasi firmware sekarang dipindah ke baris pertama main.cpp::setup()
     // agar tidak terjadi rollback race condition jika WiFi gagal konek.
@@ -55,14 +67,47 @@ void otaTask(void *pvParameters) {
 }
 
 void OTAUpdater::loop() {
-    // Check update every 24 hours (or at boot + 30s)
-    if ((_last_check == 0 && millis() > 30000) || (millis() - _last_check > 43200000)) {
+    // Cek update tiap 12 jam (atau saat boot + 30 detik), atau segera bila
+    // diminta lewat requestCheck().
+    if (_force_check || (_last_check == 0 && millis() > 30000) || (millis() - _last_check > 43200000)) {
+        _force_check = false;
         _last_check = millis();
         if (otaTaskHandle == NULL) {
             Serial.println("[OTA] Memicu FreeRTOS Background Task di Core 0...");
             xTaskCreatePinnedToCore(otaTask, "OTA_Task", 8192, this, 1, &otaTaskHandle, 0); // Core 0
         }
     }
+}
+
+void OTAUpdater::requestCheck() {
+    _prefs.remove("failed_tag");
+    _failed_tag = "";
+    _force_check = true;
+}
+
+// Satu gangguan WiFi/TLS sesaat tidak boleh langsung menjadi "gagal update"
+// yang bertahan sampai cek berikutnya (12 jam). Dicoba beberapa kali dulu.
+#define OTA_MAX_ATTEMPTS 3
+#define OTA_RETRY_DELAY_MS 10000
+
+bool OTAUpdater::downloadWithRetry(const char* url, const char* tag) {
+    for (int attempt = 1; attempt <= OTA_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 1) {
+            Serial.print("[OTA] Percobaan ulang ");
+            Serial.print(attempt);
+            Serial.print("/");
+            Serial.print(OTA_MAX_ATTEMPTS);
+            Serial.print(" (sebelumnya gagal: ");
+            Serial.print(_last_error);
+            Serial.println(")");
+            ota_status = "DOWNLOADING_FIRMWARE";
+            vTaskDelay(pdMS_TO_TICKS(OTA_RETRY_DELAY_MS));
+        }
+        if (performUpdate(url, tag)) return true;
+        // Tidak ada gunanya mengulang bila partisi memang tidak muat.
+        if (_last_error == "update_begin") break;
+    }
+    return false;
 }
 
 void OTAUpdater::checkForUpdate() {
@@ -116,7 +161,7 @@ void OTAUpdater::checkForUpdate() {
                     Serial.println("[OTA] Ditemukan file .bin! Mengunduh dari: " + bin_url);
                     networkMgr.publishLog(("Mengunduh Firmware dari: " + bin_url).c_str());
                     
-                    if (performUpdate(bin_url.c_str(), latest_tag.c_str())) {
+                    if (downloadWithRetry(bin_url.c_str(), latest_tag.c_str())) {
                         // Kita akan menandai failed_tag SETELAH download sukses tapi SEBELUM reboot. 
                         // Jika firmware baru gagal boot (crash), dia akan rollback dan blacklist ini tetap ada.
                         // Jika sukses boot, firmware baru akan menghapus blacklist ini di begin().
@@ -127,8 +172,9 @@ void OTAUpdater::checkForUpdate() {
                         delay(1000);
                         ESP.restart();
                     } else {
-                        ota_status = "ERROR_UPDATE_FAILED";
-                        Serial.println("[OTA] Update gagal!");
+                        ota_status = "ERROR_UPDATE_FAILED:" + _last_error;
+                        networkMgr.forcePublishStatus();
+                        Serial.println("[OTA] Update gagal: " + _last_error);
                     }
                 } else {
                     ota_status = "ERROR_NO_BIN_FOUND"; networkMgr.forcePublishStatus();
@@ -161,6 +207,8 @@ bool OTAUpdater::performUpdate(const char* url, const char* tag) {
     
     if (httpCode != 200) {
         ota_status = "ERROR_DOWNLOAD_" + String(httpCode);
+        _last_error = "http_" + String(httpCode);
+        http.end();
         Serial.printf("[OTA] Gagal mengunduh firmware. Kode: %d\n", httpCode);
         return false;
     }
@@ -189,6 +237,9 @@ bool OTAUpdater::performUpdate(const char* url, const char* tag) {
                 size_t readBytes = stream->readBytes(buff, toRead);
                 size_t writtenNow = Update.write(buff, readBytes);
                 if (writtenNow != readBytes) {
+                    _last_error = "tulis_flash";
+                    Update.abort();
+                    http.end();
                     Serial.printf("[OTA] Penulisan flash gagal di offset %u!\n", (unsigned)written);
                     return false;
                 }
@@ -203,6 +254,9 @@ bool OTAUpdater::performUpdate(const char* url, const char* tag) {
             } else if (millis() - last_data_ms > 15000) {
                 // Timeout: 15 detik tanpa data baru dari server
                 Serial.println("[OTA] Timeout: tidak ada data masuk selama 15 detik.");
+                _last_error = "timeout";
+                Update.abort();
+                http.end();
                 return false;
             }
             vTaskDelay(pdMS_TO_TICKS(1)); // Yield agar IDLE0/Task Watchdog tetap sehat
@@ -211,6 +265,9 @@ bool OTAUpdater::performUpdate(const char* url, const char* tag) {
         if (written == (size_t)contentLength) {
             Serial.println("[OTA] Penulisan selesai (100%).");
         } else {
+            _last_error = "koneksi_putus";
+            Update.abort();
+            http.end();
             Serial.printf("[OTA] Penulisan gagal! Ditulis: %d/%d\n", (int)written, contentLength);
             return false;
         }
@@ -227,6 +284,8 @@ bool OTAUpdater::performUpdate(const char* url, const char* tag) {
         }
     }
     
+    _last_error = canBegin ? "validasi" : "update_begin";
+    http.end();
     Serial.printf("[OTA] Error Update: %s\n", Update.errorString());
     return false;
 }
