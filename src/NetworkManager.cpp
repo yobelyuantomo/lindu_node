@@ -320,11 +320,22 @@ void NetworkManager::mqttCallback(char* topic, byte* payload, unsigned int lengt
                     Serial.printf("[ML] ml_selftest diterbitkan: %d fitur, %d sampel\n", nf, n_samples);
                 }
             }
-        } else if (doc["cmd"] == "force_update" || doc["cmd"] == "reboot") {
+        } else if (doc["cmd"] == "force_update") {
+            // Hanya memicu cek OTA. Tidak me-restart: node yang sudah di versi
+            // terbaru tidak perlu mati ~30 detik, dan restart berulang dari
+            // tombol dashboard memutus unduhan yang sedang berjalan. Node
+            // sendiri yang restart setelah pembaruan berhasil dipasang.
             String target = doc["target_node"] | "all";
             String my_id = String(instance->_configMgr->config.node_id);
             if (target == "all" || target == my_id) {
-                Serial.println("[i] Perintah Sistem: FORCE UPDATE. Menghapus Blacklist dan Restarting ESP32...");
+                Serial.println("[i] Perintah Sistem: FORCE UPDATE. Blacklist dihapus, memeriksa rilis terbaru...");
+                otaUpdater.requestCheck();
+            }
+        } else if (doc["cmd"] == "reboot") {
+            String target = doc["target_node"] | "all";
+            String my_id = String(instance->_configMgr->config.node_id);
+            if (target == "all" || target == my_id) {
+                Serial.println("[i] Perintah Sistem: REBOOT. Menghapus Blacklist dan Restarting ESP32...");
                 Preferences prefs;
                 prefs.begin("ota", false);
                 prefs.remove("failed_tag");
