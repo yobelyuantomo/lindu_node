@@ -35,6 +35,18 @@ const char* rootCACertificate = \
 void OTAUpdater::begin() {
     _prefs.begin("ota", false);
     _failed_tag = _prefs.getString("failed_tag", "");
+
+    // Penanda ini ditulis sesaat sebelum reboot setelah unduhan sukses. Bila
+    // firmware yang sedang berjalan bertag sama, berarti versi itu berhasil
+    // boot, jadi penandanya dihapus. Pembersihan lama di main.cpp hanya jalan
+    // bila state bootloader PENDING_VERIFY, yang tidak selalu terjadi; akibatnya
+    // versi yang baru saja terpasang ikut terblacklist dan menghalangi OTA
+    // ulang ke tag yang sama (ERROR_BLACKLISTED yang palsu).
+    if (_failed_tag.length() > 0 && _failed_tag == CURRENT_VERSION) {
+        Serial.println("[OTA] Penanda blacklist " + _failed_tag + " dihapus: firmware ini berhasil boot.");
+        _prefs.remove("failed_tag");
+        _failed_tag = "";
+    }
     
     // Validasi firmware sekarang dipindah ke baris pertama main.cpp::setup()
     // agar tidak terjadi rollback race condition jika WiFi gagal konek.
