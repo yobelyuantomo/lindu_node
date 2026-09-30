@@ -79,12 +79,25 @@ void NetworkManager::reconnectMQTT() {
     }
 }
 
-void NetworkManager::publishEvent(float pga, float sta_lta, int freq_hz, float ax, float ay, float az, unsigned long uptime_ms, double epoch, float lat, float lon, float temp, float pres) {
+void formatEpochMs(double epoch, char* out, size_t n) {
+    long long ms = (long long)(epoch * 1000.0 + 0.5);
+    snprintf(out, n, "%lld.%03d", ms / 1000, (int)(ms % 1000));
+}
+
+void NetworkManager::publishEvent(float pga, float sta_lta, int freq_hz, float ax, float ay, float az, unsigned long uptime_ms, double epoch, float lat, float lon, float temp, float pres, int gas_raw) {
     if (!mqtt.connected()) return;
-    
+
+    // ArduinoJson membulatkan double ke ~9 digit signifikan, sehingga epoch
+    // (10 digit) kehilangan seluruh bagian sub-detiknya dan ~10 sampel pada
+    // burst 10 Hz berbagi `ts` yang sama. Itu membuat dt = 0 di ekstraksi
+    // fitur (energi dan durasi jadi nol). Tulis sebagai angka mentah dengan
+    // milidetik; nama field tetap `ts` sehingga konsumen lama tidak berubah.
+    char ts_raw[24];
+    formatEpochMs(epoch, ts_raw, sizeof(ts_raw));
+
     StaticJsonDocument<512> doc;
     doc["node_id"] = _configMgr->config.node_id;
-    doc["ts"]      = epoch;       
+    doc["ts"]      = serialized(ts_raw);
     doc["lat"]     = lat;
     doc["lon"]     = lon;
     doc["pga"]     = pga;
@@ -100,7 +113,7 @@ void NetworkManager::publishEvent(float pga, float sta_lta, int freq_hz, float a
     doc["door_status"] = "UNAVAILABLE";
 #endif
     doc["gas_alert"] = sensorMgr.gas_leak_detected;
-    doc["gas_raw"] = sensorMgr.gas_raw_value;
+    doc["gas_raw"] = gas_raw;
     doc["temperature"] = temp;
     doc["pressure"] = pres;
     
@@ -129,7 +142,7 @@ float NetworkManager::haversine(float lat1, float lon1, float lat2, float lon2) 
 void NetworkManager::mqttCallback(char* topic, byte* payload, unsigned int length) {
     String msg;
     for (int i = 0; i < length; i++) msg += (char)payload[i];
-    
+
     if (String(topic) == "lindu/actuator/cmd/all") {
         StaticJsonDocument<1024> doc;
         DeserializationError error = deserializeJson(doc, msg);
@@ -275,6 +288,38 @@ void NetworkManager::mqttCallback(char* topic, byte* payload, unsigned int lengt
                     ESP.restart();
                 }
             }
+        } else if (doc["cmd"] == "ml_selftest") {
+            // Bukti kesetaraan ekstraksi fitur firmware vs server. Node
+            // menerbitkan vektor fitur atas jendela 2 detik terakhirnya beserta
+            // rentang waktu jendela; server mencocokkannya dengan hasil
+            // ekstraksinya sendiri atas telemetri yang sama.
+            String target = doc["target_node"] | "all";
+            String my_id = String(instance->_configMgr->config.node_id);
+            if (target == "all" || target == my_id) {
+                double t_first = 0, t_last = 0;
+                int n_samples = 0;
+                if (!mlInference.isReady() || !mlInference.selfTest(&t_first, &t_last, &n_samples)) {
+                    Serial.println("[ML] ml_selftest dilewati: model tidak siap atau buffer kosong");
+                } else {
+                    float feat[32];
+                    int nf = mlInference.lastFeatures(feat, 32);
+                    char tf[24], tl[24];
+                    formatEpochMs(t_first, tf, sizeof(tf));
+                    formatEpochMs(t_last, tl, sizeof(tl));
+                    char buf[768];
+                    int len = snprintf(buf, sizeof(buf),
+                        "{\"node_id\":\"%s\",\"model\":\"%s\",\"t_first\":%s,\"t_last\":%s,\"n_samples\":%d,\"features\":[",
+                        my_id.c_str(), mlInference.modelVersion(), tf, tl, n_samples);
+                    for (int i = 0; i < nf && len < (int)sizeof(buf) - 24; i++) {
+                        len += snprintf(buf + len, sizeof(buf) - len, "%s%.9g", i ? "," : "", feat[i]);
+                    }
+                    snprintf(buf + len, sizeof(buf) - len, "]}");
+                    char topic[64];
+                    snprintf(topic, sizeof(topic), "lindu/sensor/%s/ml_selftest", my_id.c_str());
+                    mqtt.publish(topic, buf);
+                    Serial.printf("[ML] ml_selftest diterbitkan: %d fitur, %d sampel\n", nf, n_samples);
+                }
+            }
         } else if (doc["cmd"] == "force_update" || doc["cmd"] == "reboot") {
             String target = doc["target_node"] | "all";
             String my_id = String(instance->_configMgr->config.node_id);
@@ -287,6 +332,11 @@ void NetworkManager::mqttCallback(char* topic, byte* payload, unsigned int lengt
                 delay(1000);
                 ESP.restart();
             }
+        } else if (doc["cmd"] != "ALARM_ON" && doc["cmd"] != "ALARM_UPDATE") {
+            // Perintah yang tidak dikenali dicatat, bukan dibuang diam-diam.
+            // (ALARM_* dikirim server ke topik yang sama dan ditangani di
+            // tempat lain, jadi tidak perlu dicatat di sini.)
+            Serial.printf("[i] Perintah tidak dikenal: %s\n", doc["cmd"] | "(tanpa cmd)");
         }
     }
 }

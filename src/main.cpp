@@ -345,7 +345,13 @@ void networkTaskCode(void* parameter) {
 
             // Isi jendela model. Murah: hanya menyalin satu struct ke ring
             // buffer berukuran tetap, tanpa alokasi memori.
-            mlInference.addSample(ev, getEpochTime());
+            //
+            // Satu pembacaan waktu dan satu pembacaan gas dipakai untuk buffer
+            // DAN payload MQTT, supaya jendela yang dilihat model identik dengan
+            // yang diterima server (dibutuhkan ml_selftest).
+            const double now_epoch = getEpochTime();
+            const int gas_raw_now = sensorMgr.gas_raw_value;
+            mlInference.addSample(ev, now_epoch, gas_raw_now);
 
             if (ev.pga > 0.12) {
                 local_alarm_until = millis() + 5000; // Tahan warna pink selama 5 detik
@@ -411,9 +417,9 @@ void networkTaskCode(void* parameter) {
             networkMgr.publishEvent(
                 ev.pga, ev.ratio, ev.freq_hz,
                 ev.accel_x, ev.accel_y, ev.accel_z,
-                ev.uptime_ms, getEpochTime(),
+                ev.uptime_ms, now_epoch,
                 configMgr.config.lat, configMgr.config.lon,
-                ev.temperature, ev.pressure
+                ev.temperature, ev.pressure, gas_raw_now
             );
         }
         

@@ -31,9 +31,13 @@ void MLInference::begin() {
                   EDGE_MODEL_VERSION, EDGE_N_TREES, EDGE_N_CLASSES);
 }
 
-void MLInference::addSample(const SensorEvent& ev, double epoch) {
+void MLInference::addSample(const SensorEvent& ev, double epoch, int gas_raw) {
     Sample& s = _buf[_head];
-    s.ts = epoch;
+    // Dibulatkan ke milidetik, sama seperti `ts` yang dikirim ke server
+    // (formatEpochMs). Fitur berbasis waktu (energi, durasi) dihitung dari
+    // selisih timestamp; memakai presisi mikrodetik di sini membuat node dan
+    // server berbeda ~0,5% pada sampel puncak.
+    s.ts = (double)((long long)(epoch * 1000.0 + 0.5)) / 1000.0;
     s.pga = ev.pga;
     s.sta_lta = ev.ratio;
     s.freq_hz = ev.freq_hz;
@@ -42,31 +46,50 @@ void MLInference::addSample(const SensorEvent& ev, double epoch) {
     s.az = ev.accel_z;
     s.temperature = ev.temperature;
     s.pressure = ev.pressure;
+    s.gas_raw = gas_raw;
 
     _head = (_head + 1) % ML_MAX_SAMPLES;
     if (_count < ML_MAX_SAMPLES) _count++;
 }
 
+int MLInference::windowFirst() const {
+    if (_count == 0) return 0;
+    int start = startIndex();
+    double terakhir = _buf[(start + _count - 1) % ML_MAX_SAMPLES].ts;
+    double batas = terakhir - (double)ML_WINDOW_SECONDS;
+    for (int i = 0; i < _count; i++) {
+        if (_buf[(start + i) % ML_MAX_SAMPLES].ts >= batas) return i;
+    }
+    return _count - 1;
+}
+
 bool MLInference::windowReady() const {
-    if (!_ready || _count < ML_MIN_SAMPLES) return false;
+    if (!_ready) return false;
+    int first = windowFirst();
+    if (_count - first < ML_MIN_SAMPLES) return false;
 
     // Sama seperti is_analyzable_window() di server: jendela hanya dianalisis
     // bila benar-benar terpicu. Di luar itu firmware mengirim 1 Hz, dan model
     // tidak pernah dilatih pada kepadatan sampel serendah itu.
-    for (int i = 0; i < _count; i++) {
-        if (_buf[i].pga >= ML_TRIGGER_PGA) return true;
+    int start = startIndex();
+    for (int i = first; i < _count; i++) {
+        if (_buf[(start + i) % ML_MAX_SAMPLES].pga >= ML_TRIGGER_PGA) return true;
     }
     return false;
 }
 
 void MLInference::extractFeatures() {
-    // Salin jendela ke larik terurut. Jumlahnya paling banyak ML_MAX_SAMPLES,
+    // Salin jendela ke larik terurut, hanya ML_WINDOW_SECONDS terakhir —
+    // bukan seluruh buffer. Server memotong jendela berdasarkan waktu; memakai
+    // 24 sampel terakhir akan mencampur 24 detik data 1 Hz dengan burst 10 Hz
+    // dan menggeser hampir semua fitur. Jumlahnya paling banyak ML_MAX_SAMPLES,
     // jadi aman di stack dan tidak perlu alokasi.
     Sample w[ML_MAX_SAMPLES];
-    int n = _count;
-    int start = (_count == ML_MAX_SAMPLES) ? _head : 0;
+    int first = windowFirst();
+    int n = _count - first;
+    int start = startIndex();
     for (int i = 0; i < n; i++) {
-        w[i] = _buf[(start + i) % ML_MAX_SAMPLES];
+        w[i] = _buf[(start + first + i) % ML_MAX_SAMPLES];
     }
 
     // Waktu relatif terhadap awal jendela.
@@ -150,8 +173,11 @@ void MLInference::extractFeatures() {
     // --- lingkungan --------------------------------------------------------
     float pressure_delta = (n >= 2) ? (w[n - 1].pressure - w[0].pressure) : 0.0f;
     float temp_sum = 0.0f;
-    float gas_max = 0.0f;  // node ini tidak mengirim gas_raw lewat SensorEvent
-    for (int i = 0; i < n; i++) temp_sum += w[i].temperature;
+    float gas_max = 0.0f;
+    for (int i = 0; i < n; i++) {
+        temp_sum += w[i].temperature;
+        if (w[i].gas_raw > gas_max) gas_max = (float)w[i].gas_raw;
+    }
 
     // Urutan WAJIB sama dengan FEATURE_NAMES di ml/feature_extractor.py.
     int k = 0;
@@ -195,6 +221,17 @@ MLResult MLInference::predict() {
     r.confidence = confidence;
     r.latency_us = micros() - mulai;
     return r;
+}
+
+bool MLInference::selfTest(double* t_first, double* t_last, int* n_samples) {
+    if (_count == 0) return false;
+    int first = windowFirst();
+    int start = startIndex();
+    *t_first = _buf[(start + first) % ML_MAX_SAMPLES].ts;
+    *t_last = _buf[(start + _count - 1) % ML_MAX_SAMPLES].ts;
+    *n_samples = _count - first;
+    extractFeatures();
+    return true;
 }
 
 int MLInference::lastFeatures(float* out, int max_out) const {

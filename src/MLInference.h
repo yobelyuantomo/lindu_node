@@ -51,13 +51,19 @@ public:
 
     // Masukkan satu sampel ke jendela berjalan. Murah; aman dipanggil pada
     // setiap SensorEvent.
-    void addSample(const SensorEvent& ev, double epoch);
+    void addSample(const SensorEvent& ev, double epoch, int gas_raw);
 
     // Jalankan model bila jendela memadai. Tidak pernah mengalokasikan memori.
     MLResult predict();
 
     // Apakah jendela saat ini terpicu dan cukup panjang untuk dianalisis?
     bool windowReady() const;
+
+    // Hitung fitur atas jendela 2 detik terakhir TANPA syarat terpicu, untuk
+    // `ml_selftest`. Mengisi rentang waktu dan jumlah sampel jendela yang dipakai
+    // supaya server bisa memilih baris telemetri yang persis sama.
+    // Mengembalikan false bila buffer masih kosong.
+    bool selfTest(double* t_first, double* t_last, int* n_samples);
 
     // Isi `out` dengan vektor fitur terakhir yang dihitung. Dipakai
     // `ml_selftest` untuk membuktikan kesetaraan dengan server.
@@ -70,9 +76,16 @@ public:
 private:
     void extractFeatures();
 
+    // Indeks logis (0 = sampel tertua di buffer) sampel pertama yang masih
+    // berada dalam ML_WINDOW_SECONDS terakhir. Definisinya sama dengan
+    // InferenceEngine.current_window() di server: ts >= ts_terakhir - 2 detik.
+    int windowFirst() const;
+    int startIndex() const { return (_count == ML_MAX_SAMPLES) ? _head : 0; }
+
     struct Sample {
         double ts;
         float pga, sta_lta, ax, ay, az, temperature, pressure;
+        int gas_raw;
         int freq_hz;
     };
 
